@@ -1,5 +1,5 @@
-// Comment out this line when using as DLL
-#define flecs_STATIC
+// Define this when using Flecs as a static library.
+// #define flecs_STATIC
 /**
  * @file flecs.h
  * @brief Flecs public API.
@@ -39513,4 +39513,3 @@ inline flecs::scoped_world world::scope(const char* name) const {
 
 
 #endif
-
