@@ -432,6 +432,12 @@ typedef struct ecs_world_t ecs_world_t;
 /** A stage enables modification while iterating and from multiple threads. */
 typedef struct ecs_stage_t ecs_stage_t;
 
+/** Reference to a command in the active deferred command queue. */
+typedef struct ecs_defer_cmd_ref_t {
+    ecs_stage_t *stage;
+    int32_t index;
+} ecs_defer_cmd_ref_t;
+
 /** A table stores entities and components for a specific type. */
 typedef struct ecs_table_t ecs_table_t;
 
@@ -2493,6 +2499,143 @@ void ecs_defer_suspend(
 FLECS_API
 void ecs_defer_resume(
     ecs_world_t *world);
+
+/** Add a component ID to an entity and capture the deferred command.
+ * The world or stage must already be deferred. The returned reference is only
+ * valid for the active deferred command queue, before ecs_defer_end() or purge.
+ *
+ * @param world The world or stage.
+ * @param entity The entity.
+ * @param component The component ID to add.
+ * @param out Captured command reference.
+ * @return True if the command was enqueued, false if world was not deferred.
+ */
+FLECS_API
+bool ecs_defer_cmd_add_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t component,
+    ecs_defer_cmd_ref_t *out);
+
+/** Remove a component ID from an entity and capture the deferred command.
+ * See ecs_defer_cmd_add_id().
+ *
+ * @param world The world or stage.
+ * @param entity The entity.
+ * @param component The component ID to remove.
+ * @param out Captured command reference.
+ * @return True if the command was enqueued, false if world was not deferred.
+ */
+FLECS_API
+bool ecs_defer_cmd_remove_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t component,
+    ecs_defer_cmd_ref_t *out);
+
+/** Set a component value and capture the deferred command.
+ * See ecs_defer_cmd_add_id().
+ *
+ * @param world The world or stage.
+ * @param entity The entity.
+ * @param component The component ID to set.
+ * @param size The size of the component.
+ * @param value Pointer to the component value.
+ * @param out Captured command reference.
+ * @return Pointer to the command storage, or NULL if world was not deferred.
+ */
+FLECS_API
+void* ecs_defer_cmd_set_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t component,
+    ecs_size_t size,
+    const void *value,
+    ecs_defer_cmd_ref_t *out);
+
+/** Ensure a component and capture the deferred command.
+ * See ecs_defer_cmd_add_id().
+ *
+ * @param world The world or stage.
+ * @param entity The entity.
+ * @param component The component ID to ensure.
+ * @param size The size of the component.
+ * @param out Captured command reference.
+ * @return Pointer to the command storage, or NULL if world was not deferred.
+ */
+FLECS_API
+void* ecs_defer_cmd_ensure_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t component,
+    ecs_size_t size,
+    ecs_defer_cmd_ref_t *out);
+
+/** Ensure a component from an existing or empty deferred command reference.
+ * See ecs_defer_cmd_add_id().
+ *
+ * @param world The world or stage.
+ * @param entity The entity.
+ * @param component The component ID to ensure.
+ * @param ref Command reference to inspect or overwrite.
+ * @return Pointer to component storage, or NULL if the component has no storage.
+ */
+FLECS_API
+void* ecs_defer_cmd_ensure(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t component,
+    ecs_defer_cmd_ref_t *ref);
+
+/** Emplace a component and capture the deferred command.
+ * See ecs_defer_cmd_add_id().
+ *
+ * @param world The world or stage.
+ * @param entity The entity.
+ * @param component The component ID to emplace.
+ * @param size The size of the component.
+ * @param is_new Whether this is an existing or new component.
+ * @param out Captured command reference.
+ * @return Pointer to the command storage, or NULL if world was not deferred.
+ */
+FLECS_API
+void* ecs_defer_cmd_emplace_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t component,
+    ecs_size_t size,
+    bool *is_new,
+    ecs_defer_cmd_ref_t *out);
+
+/** Test whether a captured deferred command reference resolves. */
+FLECS_API
+bool ecs_defer_cmd_ref_is_valid(
+    ecs_defer_cmd_ref_t ref);
+
+/** Return true if the deferred command makes its id present. */
+FLECS_API
+bool ecs_defer_cmd_has(
+    ecs_defer_cmd_ref_t ref);
+
+/** Try to get a value from a deferred command, promoting add commands to ensure. */
+FLECS_API
+const void* ecs_defer_cmd_try_get(
+    ecs_defer_cmd_ref_t *ref);
+
+/** Try to get a mutable value from a deferred command, promoting add commands to ensure. */
+FLECS_API
+void* ecs_defer_cmd_try_get_mut(
+    ecs_defer_cmd_ref_t *ref);
+
+/** Get a value from a deferred command, promoting add commands to ensure. */
+FLECS_API
+const void* ecs_defer_cmd_get(
+    ecs_defer_cmd_ref_t *ref);
+
+/** Get a mutable value from a deferred command, promoting add commands to ensure. */
+FLECS_API
+void* ecs_defer_cmd_get_mut(
+    ecs_defer_cmd_ref_t *ref);
 
 /** Test if deferring is enabled for the current stage.
  *

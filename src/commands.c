@@ -84,6 +84,114 @@ ecs_cmd_t* flecs_cmd_new_batched(
     return cmd;
 }
 
+static
+void flecs_defer_cmd_ref_reset(
+    ecs_defer_cmd_ref_t *out)
+{
+    if (out) {
+        out->stage = NULL;
+        out->index = -1;
+    }
+}
+
+static
+ecs_cmd_t* flecs_cmd_new_batched_capture(
+    ecs_stage_t *stage,
+    ecs_entity_t entity,
+    ecs_defer_cmd_ref_t *out)
+{
+    ecs_vec_t *cmds = &stage->cmd->queue;
+    int32_t index = ecs_vec_count(cmds);
+    ecs_cmd_t *cmd = flecs_cmd_new_batched(stage, entity);
+
+    out->stage = stage;
+    out->index = index;
+    return cmd;
+}
+
+static
+bool flecs_defer_cmd_stage(
+    ecs_world_t **world,
+    ecs_defer_cmd_ref_t *out,
+    ecs_stage_t **stage_out)
+{
+    flecs_defer_cmd_ref_reset(out);
+    ecs_check(world != NULL, ECS_INVALID_PARAMETER, NULL);
+    ecs_check(*world != NULL, ECS_INVALID_PARAMETER, NULL);
+    ecs_check(out != NULL, ECS_INVALID_PARAMETER, NULL);
+
+    ecs_stage_t *stage = flecs_stage_from_world(world);
+    if (stage->defer <= 0) {
+        return false;
+    }
+
+    *stage_out = stage;
+    return true;
+error:
+    return false;
+}
+
+static
+ecs_cmd_t* flecs_defer_cmd_from_ref(
+    ecs_defer_cmd_ref_t ref)
+{
+    ecs_stage_t *stage = ref.stage;
+    if (!stage || (stage->defer <= 0) || !stage->cmd || (ref.index < 0)) {
+        return NULL;
+    }
+
+    ecs_vec_t *cmds = &stage->cmd->queue;
+    if (ref.index >= ecs_vec_count(cmds)) {
+        return NULL;
+    }
+
+    return &ecs_vec_first_t(cmds, ecs_cmd_t)[ref.index];
+}
+
+static
+bool flecs_defer_cmd_has_id(
+    ecs_cmd_t *cmd)
+{
+    if (!cmd) {
+        return false;
+    }
+
+    switch(cmd->kind) {
+    case EcsCmdAdd:
+    case EcsCmdSet:
+    case EcsCmdSetDontFragment:
+    case EcsCmdEmplace:
+    case EcsCmdEnsure:
+    case EcsCmdEnsureDontFragment:
+    case EcsCmdModified:
+    case EcsCmdModifiedNoHook:
+    case EcsCmdAddModified:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static
+void* flecs_defer_cmd_get_value(
+    ecs_cmd_t *cmd)
+{
+    if (!cmd) {
+        return NULL;
+    }
+
+    switch(cmd->kind) {
+    case EcsCmdSet:
+    case EcsCmdSetDontFragment:
+    case EcsCmdEmplace:
+    case EcsCmdEnsure:
+    case EcsCmdEnsureDontFragment:
+        return cmd->is._1.value;
+    default:
+        return NULL;
+    }
+}
+
 bool flecs_defer_begin(
     ecs_world_t *world,
     ecs_stage_t *stage)
@@ -337,6 +445,76 @@ bool flecs_defer_remove(
     return false;
 }
 
+bool ecs_defer_cmd_add_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_defer_cmd_ref_t *out)
+{
+    ecs_stage_t *stage;
+    if (!flecs_defer_cmd_stage(&world, out, &stage)) {
+        return false;
+    }
+
+    ecs_check(id != 0, ECS_INVALID_PARAMETER, NULL);
+    ecs_cmd_t *cmd = flecs_cmd_new_batched_capture(stage, entity, out);
+    cmd->kind = EcsCmdAdd;
+    cmd->id = id;
+    cmd->entity = entity;
+    return true;
+error:
+    flecs_defer_cmd_ref_reset(out);
+    return false;
+}
+
+bool ecs_defer_cmd_remove_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_defer_cmd_ref_t *out)
+{
+    ecs_stage_t *stage;
+    if (!flecs_defer_cmd_stage(&world, out, &stage)) {
+        return false;
+    }
+
+    ecs_check(id != 0, ECS_INVALID_PARAMETER, NULL);
+    ecs_cmd_t *cmd = flecs_cmd_new_batched_capture(stage, entity, out);
+    cmd->kind = EcsCmdRemove;
+    cmd->id = id;
+    cmd->entity = entity;
+
+    /* Keep override restore behavior identical to deferred remove. */
+    ecs_record_t *r = flecs_entities_get(world, entity);
+    ecs_table_t *table = r->table;
+    ecs_table_overrides_t *o = table->data.overrides;
+    if (o) {
+        ecs_component_record_t *cr = flecs_components_get(world, id);
+        const ecs_type_info_t *ti;
+        if (cr && (ti = cr->type_info)) {
+            const ecs_table_record_t *tr = flecs_component_get_table(
+                cr, table);
+            if (tr) {
+                ecs_assert(tr->column != -1, ECS_INTERNAL_ERROR, NULL);
+                ecs_ref_t *ref = &o->refs[tr->column];
+                if (ref->entity) {
+                    void *dst = ECS_OFFSET(
+                        table->data.columns[tr->column].data,
+                        ti->size * ECS_RECORD_TO_ROW(r->row));
+                    const void *src = ecs_ref_get_id(
+                        world, &o->refs[tr->column], id);
+                    flecs_type_info_copy(dst, src, 1, ti);
+                }
+            }
+        }
+    }
+
+    return true;
+error:
+    flecs_defer_cmd_ref_reset(out);
+    return false;
+}
+
 /* Return existing component pointer & type info */
 static
 flecs_component_ptr_t flecs_defer_get_existing(
@@ -375,15 +553,16 @@ flecs_component_ptr_t flecs_defer_get_existing(
     return ptr;
 }
 
-void* flecs_defer_emplace(
+static
+void* flecs_defer_emplace_cmd(
     ecs_world_t *world,
     ecs_stage_t *stage,
     ecs_entity_t entity,
     ecs_id_t id,
     ecs_size_t size,
+    ecs_cmd_t *cmd,
     bool *is_new)
 {
-    ecs_cmd_t *cmd = flecs_cmd_new_batched(stage, entity);
     cmd->entity = entity;
     cmd->id = id;
 
@@ -408,8 +587,13 @@ void* flecs_defer_emplace(
         cmd->is._1.value = cmd_value;
         if (is_new) *is_new = true;
     } else {
+        ecs_check(is_new != NULL, ECS_INVALID_PARAMETER,
+            "cannot emplace() existing component '%s' for entity '%s' unless "
+            "'is_new' argument is provided",
+                flecs_errstr(ecs_id_str(world, id)),
+                flecs_errstr_1(ecs_get_path(world, entity)));
         cmd->kind = EcsCmdAdd;
-        if (is_new) *is_new = false;
+        *is_new = false;
     }
 
     return cmd_value;
@@ -417,16 +601,30 @@ error:
     return NULL;
 }
 
-void* flecs_defer_ensure(
+void* flecs_defer_emplace(
     ecs_world_t *world,
     ecs_stage_t *stage,
     ecs_entity_t entity,
     ecs_id_t id,
-    ecs_size_t size)
+    ecs_size_t size,
+    bool *is_new)
+{
+    ecs_cmd_t *cmd = flecs_cmd_new_batched(stage, entity);
+    return flecs_defer_emplace_cmd(
+        world, stage, entity, id, size, cmd, is_new);
+}
+
+static
+void* flecs_defer_ensure_cmd(
+    ecs_world_t *world,
+    ecs_stage_t *stage,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_size_t size,
+    ecs_cmd_t *cmd)
 {
     ecs_assert(size != 0, ECS_INTERNAL_ERROR, NULL);
 
-    ecs_cmd_t *cmd = flecs_cmd_new_batched(stage, entity);
     cmd->entity = entity;
     cmd->id = id;
 
@@ -471,18 +669,30 @@ error:
     return NULL;
 }
 
-void* flecs_defer_set(
+void* flecs_defer_ensure(
+    ecs_world_t *world,
+    ecs_stage_t *stage,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_size_t size)
+{
+    ecs_cmd_t *cmd = flecs_cmd_new_batched(stage, entity);
+    return flecs_defer_ensure_cmd(world, stage, entity, id, size, cmd);
+}
+
+static
+void* flecs_defer_set_cmd(
     ecs_world_t *world,
     ecs_stage_t *stage,
     ecs_entity_t entity,
     ecs_id_t id,
     ecs_size_t size,
+    ecs_cmd_t *cmd,
     void *value)
 {
     ecs_assert(value != NULL, ECS_INTERNAL_ERROR, NULL);
     ecs_assert(size != 0, ECS_INTERNAL_ERROR, NULL);
 
-    ecs_cmd_t *cmd = flecs_cmd_new_batched(stage, entity);
     ecs_assert(cmd != NULL, ECS_INTERNAL_ERROR, NULL);
     cmd->entity = entity;
     cmd->id = id;
@@ -551,6 +761,181 @@ void* flecs_defer_set(
     return ptr.ptr;
 error:
     return NULL;
+}
+
+void* flecs_defer_set(
+    ecs_world_t *world,
+    ecs_stage_t *stage,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_size_t size,
+    void *value)
+{
+    ecs_cmd_t *cmd = flecs_cmd_new_batched(stage, entity);
+    return flecs_defer_set_cmd(world, stage, entity, id, size, cmd, value);
+}
+
+void* ecs_defer_cmd_set_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_size_t size,
+    const void *value,
+    ecs_defer_cmd_ref_t *out)
+{
+    ecs_stage_t *stage;
+    if (!flecs_defer_cmd_stage(&world, out, &stage)) {
+        return NULL;
+    }
+
+    ecs_cmd_t *cmd = flecs_cmd_new_batched_capture(stage, entity, out);
+    void *result = flecs_defer_set_cmd(
+        world, stage, entity, id, size, cmd, ECS_CONST_CAST(void*, value));
+    if (!result) {
+        flecs_defer_cmd_ref_reset(out);
+    }
+    return result;
+}
+
+void* ecs_defer_cmd_ensure_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_size_t size,
+    ecs_defer_cmd_ref_t *out)
+{
+    ecs_stage_t *stage;
+    if (!flecs_defer_cmd_stage(&world, out, &stage)) {
+        return NULL;
+    }
+
+    ecs_cmd_t *cmd = flecs_cmd_new_batched_capture(stage, entity, out);
+    void *result = flecs_defer_ensure_cmd(
+        world, stage, entity, id, size, cmd);
+    if (!result) {
+        flecs_defer_cmd_ref_reset(out);
+    }
+    return result;
+}
+
+static
+void* flecs_defer_cmd_ensure_with_type_info(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_defer_cmd_ref_t *ref)
+{
+    const ecs_type_info_t *ti = ecs_get_type_info(world, id);
+    if (!ti || !ti->size) {
+        return NULL;
+    }
+
+    return ecs_defer_cmd_ensure_id(world, entity, id, ti->size, ref);
+}
+
+void* ecs_defer_cmd_ensure(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_defer_cmd_ref_t *ref)
+{
+    ecs_check(ref != NULL, ECS_INVALID_PARAMETER, NULL);
+
+    if (ecs_defer_cmd_ref_is_valid(*ref)) {
+        void *value = ecs_defer_cmd_try_get_mut(ref);
+        if (value) {
+            return value;
+        }
+    }
+
+    return flecs_defer_cmd_ensure_with_type_info(world, entity, id, ref);
+error:
+    return NULL;
+}
+
+void* ecs_defer_cmd_emplace_id(
+    ecs_world_t *world,
+    ecs_entity_t entity,
+    ecs_id_t id,
+    ecs_size_t size,
+    bool *is_new,
+    ecs_defer_cmd_ref_t *out)
+{
+    ecs_stage_t *stage;
+    if (!flecs_defer_cmd_stage(&world, out, &stage)) {
+        return NULL;
+    }
+
+    ecs_cmd_t *cmd = flecs_cmd_new_batched_capture(stage, entity, out);
+    void *result = flecs_defer_emplace_cmd(
+        world, stage, entity, id, size, cmd, is_new);
+    if (!result) {
+        flecs_defer_cmd_ref_reset(out);
+    }
+    return result;
+}
+
+bool ecs_defer_cmd_ref_is_valid(
+    ecs_defer_cmd_ref_t ref)
+{
+    return flecs_defer_cmd_from_ref(ref) != NULL;
+}
+
+bool ecs_defer_cmd_has(
+    ecs_defer_cmd_ref_t ref)
+{
+    ecs_cmd_t *cmd = flecs_defer_cmd_from_ref(ref);
+    return flecs_defer_cmd_has_id(cmd);
+}
+
+void* ecs_defer_cmd_try_get_mut(
+    ecs_defer_cmd_ref_t *ref)
+{
+    ecs_check(ref != NULL, ECS_INVALID_PARAMETER, NULL);
+
+    ecs_cmd_t *cmd = flecs_defer_cmd_from_ref(*ref);
+    if (!flecs_defer_cmd_has_id(cmd)) {
+        return NULL;
+    }
+
+    void *value = flecs_defer_cmd_get_value(cmd);
+    if (value) {
+        return value;
+    }
+
+    ecs_world_t *world = ref->stage->world;
+    value = ecs_get_mut_id(world, cmd->entity, cmd->id);
+    if (value) {
+        return value;
+    }
+
+    ecs_entity_t entity = cmd->entity;
+    ecs_id_t id = cmd->id;
+    return flecs_defer_cmd_ensure_with_type_info((ecs_world_t*)ref->stage, entity, id, ref);
+error:
+    return NULL;
+}
+
+const void* ecs_defer_cmd_try_get(
+    ecs_defer_cmd_ref_t *ref)
+{
+    return ecs_defer_cmd_try_get_mut(ref);
+}
+
+void* ecs_defer_cmd_get_mut(
+    ecs_defer_cmd_ref_t *ref)
+{
+    void *result = ecs_defer_cmd_try_get_mut(ref);
+    ecs_assert(result != NULL, ECS_INVALID_OPERATION, NULL);
+    return result;
+}
+
+const void* ecs_defer_cmd_get(
+    ecs_defer_cmd_ref_t *ref)
+{
+    const void *result = ecs_defer_cmd_try_get(ref);
+    ecs_assert(result != NULL, ECS_INVALID_OPERATION, NULL);
+    return result;
 }
 
 /* Same as flecs_defer_set, but doesn't copy value into storage. */
