@@ -13504,6 +13504,18 @@ FLECS_API
 int ecs_http_server_start(
     ecs_http_server_t* server);
 
+/** Get the port on which the server is listening.
+ * This operation returns zero until the server has successfully bound its
+ * listening socket. The returned port reflects collision retries performed by
+ * the server thread and can therefore differ from the configured port.
+ *
+ * @param server The server.
+ * @return The bound port, or zero if the server is not listening.
+ */
+FLECS_API
+uint16_t ecs_http_server_get_port(
+    const ecs_http_server_t* server);
+
 /** Process server requests.
  * This operation invokes the reply callback for each received request. No new
  * requests will be enqueued while processing requests.
@@ -39606,4 +39618,3 @@ inline flecs::entity enum_data<E>::entity(E value) const {
 #endif
 
 #endif
-

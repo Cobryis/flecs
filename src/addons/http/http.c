@@ -1050,9 +1050,14 @@ int http_accept_connections(
             goto done;
         }
 
-        int reuse = 1, result;
-        result = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, 
-            (char*)&reuse, ECS_SIZEOF(reuse)); 
+        int socket_option = 1, result;
+#if defined(ECS_TARGET_WINDOWS)
+        result = setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+            (char*)&socket_option, ECS_SIZEOF(socket_option));
+#else
+        result = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+            (char*)&socket_option, ECS_SIZEOF(socket_option));
+#endif
         if (result) {
             ecs_warn("http: failed to setsockopt: %s", ecs_os_strerror(errno));
         }
@@ -1069,13 +1074,21 @@ int http_accept_connections(
 
         result = http_bind(sock, addr, addr_len);
         if (result) {
-            if (errno == EADDRINUSE) {
+#if defined(ECS_TARGET_WINDOWS)
+            int bind_error = WSAGetLastError();
+            bool address_in_use = bind_error == WSAEADDRINUSE ||
+                bind_error == WSAEACCES;
+#else
+            int bind_error = errno;
+            bool address_in_use = bind_error == EADDRINUSE;
+#endif
+            if (address_in_use) {
                 ret = 1;
                 ecs_warn("http: address '%s:%s' in use, retrying with port %u", 
                     addr_host, addr_port, srv->port + 1);
             } else {
-                ecs_err("http: failed to bind to '%s:%s': %s", 
-                    addr_host, addr_port, ecs_os_strerror(errno));
+                ecs_err("http: failed to bind to '%s:%s' (error = %d)",
+                    addr_host, addr_port, bind_error);
             }
 
             ecs_os_mutex_unlock(srv->lock);
@@ -1414,6 +1427,20 @@ int ecs_http_server_start(
     return 0;
 error:
     return -1;
+}
+
+uint16_t ecs_http_server_get_port(
+    const ecs_http_server_t *server)
+{
+    ecs_check(server != NULL, ECS_INVALID_PARAMETER, NULL);
+
+    ecs_http_server_t *srv = ECS_CONST_CAST(ecs_http_server_t*, server);
+    ecs_os_mutex_lock(srv->lock);
+    uint16_t port = http_socket_is_valid(srv->sock) ? srv->port : 0;
+    ecs_os_mutex_unlock(srv->lock);
+    return port;
+error:
+    return 0;
 }
 
 void ecs_http_server_stop(
